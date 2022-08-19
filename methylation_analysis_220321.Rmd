@@ -1,0 +1,196 @@
+---
+title: "Nanopore Methylation analysis of NL from G2021-140"
+output: html_notebook
+---
+
+Comparing NL_M35 (control) vs NL_M125 rats
+
+library(tidyverse)
+library(DSS)
+library(bsseq)
+library(data.table)
+library(ChIPseeker)
+library("TxDb.Rnorvegicus.UCSC.rn6.refGene")
+library("org.Rn.eg.db")
+library(dplyr)
+
+
+```{r}
+#read in methylation frequency files into list of tables of each sample
+meth_files <- list.files(pattern = "tsv",full.names = T)
+
+meth_data <- lapply(meth_files,fread,header=T,stringsAsFactors=F)
+names(meth_data) <- c("NL_M35_1","NL_M35_2","NL_M35_3","NL_M125_1","NL_M125_2","NL_M125_3")
+
+#Bsseq requires width of at least 1 (meth_freq files have start and end position that are the same)
+meth_data <- lapply(meth_data,function(x) {
+  x[,start:=start-1][order(chromosome,start)]
+})
+```
+
+#Clean up meth freq data. Columns remaining: chromosome, start, end, Cov."Sample name", M."Sample name". 
+#Cov/M allows us to differentiate coverage and methylation to later seperate
+```{r tidy}
+meth_data_tidied <- Map(function(x,name) {
+  dat <- x[,.(chromosome,start,end,called_sites,called_sites_methylated)]
+  setnames(dat,c("called_sites","called_sites_methylated"),c(paste0("Cov.",name),paste0("M.",name)))
+  return(dat)
+},x=meth_data,name=names(meth_data))
+
+#Combine all data. Contains all methylation positions and all Cov and M for each sample
+Combined <- Reduce(function(x,y) merge(x,y,by=c("chromosome","start","end"),all=T),meth_data_tidied) 
+
+#Separate only coverage, rename to only contain sample names
+Cov_mat <- dplyr::select(Combined,starts_with("Cov")) %>%
+  rename_all(function(x) gsub("Cov.","",x)) %>%
+  mutate_all(function(x) ifelse(is.na(x),0,x)) %>%
+  as.matrix()
+
+#Separate only methylation, rename to only contain sample names
+## "fixed = TRUE" is necessary, otherwise, "M1" in "NL_M125_1" will be replaced with empty. "." is a special character meaning "any character".
+Meth_mat <- dplyr::select(Combined,starts_with("M.")) %>%
+  rename_all(function(x) gsub("M.","",x, fixed = TRUE)) %>%
+  mutate_all(function(x) ifelse(is.na(x),0,x)) %>%
+  as.matrix()
+
+## make BSseq object
+bss <- BSseq(chr=Combined$chromosome,pos = Combined$start,Cov=Cov_mat,M=Meth_mat,sampleNames = colnames(Cov_mat))
+bss
+
+```
+```{r}
+#Take a look at BSseq object
+pData(bss)
+
+#Add treatments and coreIDs to samples (rownames)
+row.names(pData(bss))
+pData(bss)$Treat <- c("NL_M35","NL_M35","NL_M35","NL_M125","NL_M125","NL_M125")
+pData(bss)$CoreID <- c("G2021_140_1","G2021_140_2","G2021_140_3","G2021_140_4","G2021_140_5","G2021_140_6")
+pData(bss)
+```
+#Look at average coverage
+```{r cov}
+cov <- getCoverage(bss,type = "Cov")
+colMeans(cov)
+```
+
+
+```{r filter}
+#loci.idx - select only loci with reads in at least 2 samples (creates vector with row #'s)
+##Create filtered bsseq object. Save both.
+loci.idx <- which(rowSums(getCoverage(bss, type="Cov")>0) >=2)
+
+bss_filtered <- bss[loci.idx]
+
+save(bss_filtered, file = "bss_filt")
+
+save(bss, file="bss_full")
+
+```
+#Call and test Differentially methylated regions and loci
+```{r call dm}
+dml <- DMLtest(BSobj = bss[loci.idx],
+               group1 = c("NL_M35_1","NL_M35_2","NL_M35_3"),
+               group2 = c("NL_M125_1","NL_M125_2","NL_M125_3"),
+               smoothing = T)
+
+save(dml,file=file.path(out,"dml_object.rda"))
+
+DMLs <- callDML(dml)
+
+dmr <- callDMR(dml,minCG = 2, delta = 0.1, minlen = 1)
+
+
+```
+
+```{r testing bsmooth}
+bss.fit <- BSmooth(BSseq = bss,
+                   BPPARAM = MulticoreParam(workers = 4),
+                   verbose = T)
+save(bss.fit,file=file.path(out,"bssFit_object.rda"))
+```
+
+#Export DML table of all sites and plot pie annotation
+```{r all sites}
+
+dml$end <- dml$pos
+colnames(dml)[2] <- "start"
+all_sites_grange <- makeGRangesFromDataFrame(dml,keep.extra.columns = T)
+
+annotated_sites <- annotatePeak(all_sites_grange,TxDb=TxDb.Rnorvegicus.UCSC.rn6.refGene,annoDb = 'org.Rn.eg.db')
+
+write.table(as.data.frame(annotated_sites),sep = "\t",file ="all_sites_differential_methylation_stats.tsv",row.names=F,quote = F)
+
+pdf(file = "G2021_140_annotation_pie_differentially_methylated_sites_ALL.pdf")
+plotAnnoPie(annotated_sites)
+dev.off()
+
+```
+#Export DML table of sig sites and plot annotation
+```{r dml annotation}
+DMLs$end <- DMLs$pos
+colnames(DMLs)[2] <- "start"
+DM_grange <- makeGRangesFromDataFrame(DMLs,keep.extra.columns = T)
+
+annotated_DM <- annotatePeak(DM_grange,TxDb=TxDb.Rnorvegicus.UCSC.rn6.refGene,annoDb = 'org.Rn.eg.db')
+write.table(as.data.frame(annotated_DM),sep = "\t",file ="G2021_140_SIG_sites_differential_methylation_stats.tsv",row.names=F,quote = F)
+
+annotated_DM_df = as.data.frame(annotated_DM)
+annotated_DM_df = as.data.frame(cbind(annotated_DM_df$SYMBOL, annotated_DM_df$ENSEMBL))
+annotated_DM_df_2  = distinct(annotated_DM_df, V1, .keep_all = TRUE)
+colnames(annotated_DM_df_2)[1] <- "SYMBOL"
+colnames(annotated_DM_df_2)[2] <- "ENSEMBL"
+write.csv(annotated_DM_df_2, file = "G2021_140_SIG_gene_list.csv",row.names=F,quote = F)
+
+annotated_DM_df = as.data.frame(annotated_DM)
+annotated_DM_df = as.data.frame(cbind(annotated_DM_df$SYMBOL, annotated_DM_df$ENSEMBL, annotated_DM_df$annotation))
+annotated_DM_df_2  = distinct(annotated_DM_df, V1, .keep_all = TRUE)
+colnames(annotated_DM_df_2)[1] <- "SYMBOL"
+colnames(annotated_DM_df_2)[2] <- "ENSEMBL"
+colnames(annotated_DM_df_2)[3] <- "annotation"
+annotated_DM_df_2_ss <- annotated_DM_df_2[grep("Promoter", annotated_DM_df_2$annotation),]
+write.csv(annotated_DM_df_2_ss, file ="G2021_140_SIG_promoter_gene_list.csv",row.names=F,quote = F)
+
+annotated_DM_df_2_NoDI <- annotated_DM_df_2[grep("Distal Intergenic", annotated_DM_df_2$annotation, invert = TRUE),]
+
+write.csv(annotated_DM_df_2_NoDI, file = "G2021_140_SIG_NoDI_gene_list.csv", row.names=F, quote = F)
+
+pdf(file = "G2021_140_annotation_venn_differentially_methylated_sites_SIG.pdf")
+plotAnnoPie(annotated_DM)
+dev.off()
+```
+
+
+##PCA
+load("pca_data.rda")
+
+pca_data <- as.data.frame(pca$x)
+
+pca_data$Treat <- pData(bss)$Treat
+
+pca_data$CoreNumber <- pData(bss)$CoreID
+
+percentVar <- round((pca$sdev^2/sum(pca$sdev^2))*100)
+
+ggplot(data=pca_data,aes(PC1,PC2,color=Treat)) +
+  geom_point(size=3) + 
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2], "% variance")) +
+  theme_bw()
+  
+ggsave(filename = "pca.pdf")
+
+
+##Beta distribution
+load("bss_smooth_meth.rda")
+
+meth_NA %>%
+  as.data.frame() %>%
+  gather(Sample,beta) %>%
+  ggplot(.,aes(x=beta,color=Sample)) +
+  geom_density(aes(group=Sample)) +
+  theme_light()
+
+ggsave(filename ="beta_distribution.pdf")
+
+
